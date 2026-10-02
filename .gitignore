@@ -1,0 +1,53 @@
+# Build output and packaged releases
+**/bin/
+**/obj/
+/artifacts/
+*.exe
+*.dll
+*.pdb
+*.zip
+*.7z
+*.msi
+*.msix
+
+# IDE and local settings
+.vs/
+.idea/
+.vscode/
+*.user
+*.suo
+.env
+.env.*
+
+# User state and browser profiles must never be committed
+queue.json
+queue.json.*
+**/WebView2/
+**/*WebView2*/
+**/EBWebView/
+**/User Data/
+**/BilibiliUploader/
+**/Cookies
+**/Cookies-journal
+**/Login Data*
+**/Local State
+*.log
+*.dmp
+*.tmp
+*-preview.png
+smoke-ready.txt
+
+# Videos and local recordings
+*.mp4
+*.flv
+*.avi
+*.wmv
+*.mov
+*.webm
+*.mpeg4
+*.ts
+*.mpg
+*.rm
+*.rmvb
+*.mkv
+*.m4v
