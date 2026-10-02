@@ -29,16 +29,23 @@ public sealed class MainForm : Form
     private readonly ComboBox copyright = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList };
     private readonly NumericUpDown retries = new() { Minimum = 0, Maximum = 5, Value = 2, Width = 100 };
     private readonly Label titlePreview = Label("预览：先在队列中添加视频", 10, Muted);
+    private readonly PictureBox coverPreview = new() { Dock = DockStyle.Fill, SizeMode = PictureBoxSizeMode.Zoom, BorderStyle = BorderStyle.FixedSingle, BackColor = Color.FromArgb(246, 248, 251) };
+    private readonly Label coverDescription = Label("平台默认封面", 9, Muted);
+    private readonly ComboBox season = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList, DisplayMember = "Title" };
+    private readonly ComboBox section = new() { Dock = DockStyle.Fill, DropDownStyle = ComboBoxStyle.DropDownList, DisplayMember = "Title" };
+    private readonly Label seasonStatus = Label("登录后刷新已有合集；可用范围取决于账号的合集权限。", 9, Muted);
     private readonly TextBox log = new() { Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, BorderStyle = BorderStyle.None, BackColor = Color.FromArgb(246, 248, 251), ScrollBars = ScrollBars.Vertical };
-    private Button start = null!, pause = null!, stop = null!, add = null!, remove = null!, refresh = null!;
+    private Button start = null!, pause = null!, stop = null!, add = null!, remove = null!, refresh = null!, refreshSeasons = null!;
     private Panel settings = null!;
     private BiliApi? api;
     private UposUploader? uploader;
     private QueueRunner? runner;
     private HttpClient? http;
     private CancellationTokenSource? runCancel;
-    private bool busyAccount, paused, closing, stateReadFailed;
+    private bool busyAccount, busySeasons, paused, closing, stateReadFailed, settingSeasonChoices;
     private string accountId = "";
+    private string selectedCoverPath = "", selectedSeasonOwnerMid = "";
+    private readonly CancellationTokenSource lifetime = new();
     private readonly System.Windows.Forms.Timer timer = new() { Interval = 500 };
     private DateTime lastProgress = DateTime.MinValue;
     private readonly Dictionary<string, DataGridViewRow> rows = [];
@@ -47,6 +54,12 @@ public sealed class MainForm : Form
     {
         this.smokeTest = smokeTest;
         directory = smokeTest ? Path.Combine(Path.GetTempPath(), "BilibiliUploader-smoke") : LocalState.DataDirectory;
+        if (smokeTest)
+        {
+            Directory.CreateDirectory(directory);
+            File.Delete(Path.Combine(directory, "smoke-ready.txt"));
+            File.Delete(Path.Combine(directory, "smoke-failed.txt"));
+        }
         Text = "Bilibili 视频上传助手 · " + Application.ProductVersion.Split('+')[0];
         StartPosition = FormStartPosition.CenterScreen;
         MinimumSize = new Size(1000, 720); Size = new Size(1220, 850);
@@ -120,25 +133,57 @@ public sealed class MainForm : Form
         var page = Page("投稿预设");
         settings = new Panel { Dock = DockStyle.Fill, AutoScroll = true };
         var table = new TableLayoutPanel { Dock = DockStyle.Top, AutoSize = true, ColumnCount = 2, Padding = new Padding(8) };
-        table.ColumnStyles.Add(new(SizeType.Absolute, 140)); table.ColumnStyles.Add(new(SizeType.Percent, 100));
-        void Row(string label, Control control, int height = 52)
+        table.ColumnStyles.Add(new(SizeType.Absolute, 120)); table.ColumnStyles.Add(new(SizeType.Percent, 100));
+        void Row(string label, Control control, int height = 46)
         {
             var row = table.RowCount++; table.RowStyles.Add(new(SizeType.Absolute, height));
             table.Controls.Add(Label(label, 10, Ink), 0, row); table.Controls.Add(control, 1, row);
-            control.Margin = new Padding(0, 4, 8, 12);
+            control.Margin = new Padding(0, 4, 8, 8);
         }
-        Row("标题模板", title);
-        Row("支持的变量", Label("{title} 去除录像时间前缀的标题    {filename} 完整文件名    {index} 队列序号\n{record_date} 录像日期 2024-01-02    {record_date:yyyy.M.d} 录像日期 2024.1.2\n{date} 上传日期 2024-01-02    {date:yyyy.M.d} 上传日期 2024.1.2", 10, Muted), 92);
-        Row("回放模板", Button("使用直播回放模板", () => title.Text = PublishPreset.ReplayTitleTemplate), 68);
+        var titleEditor = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
+        titleEditor.ColumnStyles.Add(new(SizeType.Percent, 100)); titleEditor.ColumnStyles.Add(new(SizeType.Absolute, 175));
+        titleEditor.RowStyles.Add(new(SizeType.Percent, 100));
+        var replay = Button("使用回放模板", () => title.Text = PublishPreset.ReplayTitleTemplate);
+        replay.AutoSize = false; replay.Padding = new Padding(4, 0, 4, 0);
+        replay.Margin = new Padding(8, 0, 0, 0); replay.Dock = DockStyle.Fill;
+        title.Margin = Padding.Empty; titleEditor.Controls.Add(title); titleEditor.Controls.Add(replay);
+        Row("标题模板", titleEditor, 50);
+        Row("支持的变量", Label("{title} 录像标题  ·  {filename} 完整文件名  ·  {index} 序号\n{record_date} / {record_date:yyyy.M.d} 录像日期  ·  {date} / {date:yyyy.M.d} 上传日期", 9, Muted), 62);
         titlePreview.AutoSize = false; titlePreview.Dock = DockStyle.Fill;
-        Row("标题预览", titlePreview, 90);
+        Row("标题预览", titlePreview, 52);
+        var coverEditor = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 2, Margin = Padding.Empty };
+        coverEditor.ColumnStyles.Add(new(SizeType.Absolute, 150)); coverEditor.ColumnStyles.Add(new(SizeType.Percent, 100));
+        coverEditor.RowStyles.Add(new(SizeType.Percent, 100)); coverEditor.RowStyles.Add(new(SizeType.Absolute, 44));
+        coverPreview.Margin = new Padding(0, 0, 12, 0); coverEditor.Controls.Add(coverPreview, 0, 0); coverEditor.SetRowSpan(coverPreview, 2);
+        coverDescription.AutoSize = false; coverDescription.AutoEllipsis = true; coverDescription.Dock = DockStyle.Fill;
+        coverEditor.Controls.Add(coverDescription, 1, 0);
+        var coverActions = new FlowLayoutPanel { Dock = DockStyle.Fill, WrapContents = false, Margin = Padding.Empty };
+        var selectCover = Button("选择 JPG / PNG", SelectCover);
+        var clearCover = Button("清除封面", () => SetCoverPath(""));
+        selectCover.AutoSize = clearCover.AutoSize = false;
+        selectCover.Size = new Size(185, 37); clearCover.Size = new Size(122, 37);
+        selectCover.Padding = clearCover.Padding = new Padding(4, 0, 4, 0);
+        coverActions.Controls.AddRange([selectCover, clearCover]);
+        coverEditor.Controls.Add(coverActions, 1, 1); Row("批次封面", coverEditor, 112);
+        var seasonEditor = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 2, RowCount = 1, Margin = Padding.Empty };
+        seasonEditor.ColumnStyles.Add(new(SizeType.Percent, 100)); seasonEditor.ColumnStyles.Add(new(SizeType.Absolute, 175));
+        seasonEditor.RowStyles.Add(new(SizeType.Percent, 100));
+        season.Margin = Padding.Empty;
+        refreshSeasons = Button("刷新已有合集", () => _ = RefreshSeasonsAsync());
+        refreshSeasons.AutoSize = false; refreshSeasons.Padding = new Padding(4, 0, 4, 0);
+        refreshSeasons.Margin = new Padding(8, 0, 0, 0); refreshSeasons.Dock = DockStyle.Fill;
+        seasonEditor.Controls.Add(season); seasonEditor.Controls.Add(refreshSeasons);
+        Row("加入合集", seasonEditor, 50); Row("合集分节", section);
+        seasonStatus.AutoSize = false; seasonStatus.Dock = DockStyle.Fill;
+        Row("", seasonStatus, 54);
+        season.SelectedIndexChanged += (_, _) => OnSeasonChanged();
         Row("投稿分区", category);
         Row("标签", tags); Row("", Label("用逗号分隔，例如：游戏, 直播录像；分区登录后从平台读取。", 9, Muted), 38);
         desc.Multiline = true; desc.ScrollBars = ScrollBars.Vertical; Row("视频简介", desc, 110);
         copyright.Items.AddRange(["原创", "转载"]); copyright.SelectedIndex = 0; Row("作品类型", copyright);
         Row("转载来源", source);
-        Row("分片失败重试", retries);
-        Row("", Label("发布请求不自动重试；每个视频独立投稿，采用平台默认封面。", 9, Muted), 42);
+        Row("分片重试", retries);
+        Row("", Label("封面与合集应用于当前批次；不选封面时采用平台默认。发布请求不自动重试。", 9, Muted), 42);
         Row("", Button("保存预设", SavePreset, true), 68);
         title.TextChanged += (_, _) => UpdatePreview();
         copyright.SelectedIndexChanged += (_, _) => source.Enabled = copyright.SelectedIndex == 1;
@@ -198,6 +243,7 @@ public sealed class MainForm : Form
                 grid.ClearSelection(); grid.Rows[0].Selected = true;
                 if (titlePreview.Text != "【直播回放2024.1.2】示例录像")
                     throw new InvalidOperationException("录像标题预览验证失败。");
+                VerifyCoverAndSeasonUi();
                 PerformLayout();
                 using (var capture = new Bitmap(Width, Height))
                 {
@@ -206,12 +252,26 @@ public sealed class MainForm : Form
                 }
                 tabs.SelectedIndex = 1;
                 PerformLayout();
+                WindowState = FormWindowState.Minimized; WindowState = FormWindowState.Normal;
+                TopMost = true; BringToFront(); Activate();
                 await Task.Delay(150);
                 using (var capture = new Bitmap(Width, Height))
                 {
                     DrawToBitmap(capture, new Rectangle(0, 0, Width, Height));
                     capture.Save(Path.Combine(directory, "settings-preview.png"));
+                    capture.Save(Path.Combine(directory, "settings-cover-preview.png"));
                 }
+                CaptureSmokeScreen("settings-cover-screen.png");
+                settings.AutoScrollPosition = new Point(0, settings.DisplayRectangle.Height);
+                PerformLayout(); await Task.Delay(100);
+                using (var capture = new Bitmap(Width, Height))
+                {
+                    DrawToBitmap(capture, new Rectangle(0, 0, Width, Height));
+                    capture.Save(Path.Combine(directory, "settings-bottom-preview.png"));
+                }
+                CaptureSmokeScreen("settings-bottom-screen.png");
+                TopMost = false;
+                settings.AutoScrollPosition = Point.Empty;
                 var loaded = new TaskCompletionSource<bool>();
                 browser.CoreWebView2.NavigationCompleted += (_, e) => loaded.TrySetResult(e.IsSuccess);
                 tabs.SelectedIndex = 2;
@@ -229,7 +289,9 @@ public sealed class MainForm : Form
                 }
                 catch (Exception ex) { accountCheck = "Official API check incomplete: " + UposUploader.SafeMessage(ex.Message); }
                 var origin = Uri.TryCreate(browser.CoreWebView2.Source, UriKind.Absolute, out var current) ? current.GetLeftPart(UriPartial.Authority) : "unknown";
-                File.WriteAllText(Path.Combine(directory, "smoke-ready.txt"), "WebView2 initialized; UI ready\nTitle preview: " + titlePreview.Text + "\n" + accountCheck + "\nOfficial page origin: " + origin);
+                File.WriteAllText(Path.Combine(directory, "smoke-ready.txt"), "WebView2 initialized; UI ready\nTitle preview: " + titlePreview.Text
+                    + "\nCover and season UI: synthetic image load/clear, simulated season/section selection, preset persistence and refresh lock passed."
+                    + "\n" + accountCheck + "\nOfficial page origin: " + origin);
                 Close();
                 return;
             }
@@ -239,19 +301,218 @@ public sealed class MainForm : Form
         catch (Exception ex)
         {
             start.Enabled = false; WriteLog("初始化失败：" + UposUploader.SafeMessage(ex.Message));
+            if (smokeTest)
+            {
+                File.WriteAllText(Path.Combine(directory, "smoke-failed.txt"), UposUploader.SafeMessage(ex.Message));
+                Close(); return;
+            }
             MessageBox.Show("客户端启动失败。请确认已安装 Microsoft Edge WebView2 Runtime。\n" + UposUploader.SafeMessage(ex.Message), Text);
         }
+    }
+    private void CaptureSmokeScreen(string filename)
+    {
+        // Capture only this synthetic smoke-test window, never the rest of the desktop.
+        if (!smokeTest) return;
+        using var capture = new Bitmap(ClientSize.Width, ClientSize.Height);
+        using var graphics = Graphics.FromImage(capture);
+        graphics.CopyFromScreen(PointToScreen(Point.Empty), Point.Empty, ClientSize);
+        capture.Save(Path.Combine(directory, filename));
+    }
+    private void VerifyCoverAndSeasonUi()
+    {
+        Directory.CreateDirectory(directory);
+        var sample = Path.Combine(directory, "synthetic-cover.png");
+        using (var drawing = new Bitmap(1146, 717))
+        {
+            using var graphics = Graphics.FromImage(drawing);
+            graphics.Clear(Color.FromArgb(230, 246, 253));
+            using var brush = new SolidBrush(Blue);
+            graphics.FillRectangle(brush, 70, 80, 1006, 480);
+            using var font = new Font("Microsoft YaHei UI", 42);
+            graphics.DrawString("示例封面 · 本地验证", font, Brushes.White, 200, 270);
+            drawing.Save(sample, System.Drawing.Imaging.ImageFormat.Png);
+        }
+        SetCoverPath(sample);
+        if (coverPreview.Image == null || ReadPreset().CoverPath != sample) throw new InvalidOperationException("封面加载验证失败。");
+        SetCoverPath("");
+        if (coverPreview.Image != null || ReadPreset().CoverPath.Length != 0) throw new InvalidOperationException("清除封面验证失败。");
+        SetCoverPath(sample);
+        VideoSeason[] examples = [new(401, "示例合集（模拟数据）", [new(410, "第一节（模拟）"), new(411, "第二节（模拟）")]),
+            new(402, "另一个合集（模拟数据）", [new(420, "默认分节（模拟）")])];
+        accountId = "10000";
+        SetSeasonChoices(examples);
+        season.SelectedIndex = 1; section.SelectedIndex = 1;
+        if (ReadPreset().SeasonId != 401 || ReadPreset().SectionId != 411 || ReadPreset().SeasonOwnerMid != "10000")
+            throw new InvalidOperationException("合集分节选择验证失败。");
+        season.SelectedIndex = 2;
+        if (ReadPreset().SectionId != 420) throw new InvalidOperationException("切换合集后的分节验证失败。");
+        season.SelectedIndex = 0;
+        if (ReadPreset().SeasonId != 0 || ReadPreset().SectionId != 0 || ReadPreset().SeasonOwnerMid.Length != 0 || section.Enabled)
+            throw new InvalidOperationException("不加入合集验证失败。");
+        season.SelectedIndex = 1; section.SelectedIndex = 1;
+        state.Preset = ReadPreset(); state.Save(directory);
+        var reloaded = LocalState.Load(directory);
+        if (reloaded.Preset.CoverPath != sample || reloaded.Preset.SeasonId != 401 || reloaded.Preset.SectionId != 411 || reloaded.Preset.SeasonOwnerMid != "10000")
+            throw new InvalidOperationException("封面与合集的预设保存验证失败。");
+        state.Preset = reloaded.Preset; LoadPreset();
+        if (ReadPreset().SeasonId != 401 || ReadPreset().SectionId != 411 || coverPreview.Image == null)
+            throw new InvalidOperationException("封面与合集的预设还原验证失败。");
+        SetSeasonChoices(examples, 401, "示例合集（模拟数据）", 411, "第二节（模拟）", "10000");
+        busySeasons = true; UpdateAvailability();
+        if (start.Enabled || settings.Enabled) throw new InvalidOperationException("读取合集时未锁定投稿设置。");
+        busySeasons = false; UpdateAvailability();
+        using (var changed = JsonDocument.Parse("{\"isLogin\":true,\"mid\":10001,\"uname\":\"模拟账号\"}")) ApplyAccount(changed.RootElement);
+        if (ReadPreset().SeasonId != 0 || state.Preset.SeasonId != 0) throw new InvalidOperationException("切换账号后未清除原合集。");
+        SetSeasonChoices(examples, 401, "示例合集（模拟数据）", 411, "第二节（模拟）", "10001");
+        if (!season.Text.Contains("模拟") || !section.Text.Contains("模拟")) throw new InvalidOperationException("合集或分节名称未显示。");
+        accountId = ""; account.Text = "测试模式 · 未连接账号";
+        seasonStatus.ForeColor = Muted;
+        seasonStatus.Text = "界面验证：上方为模拟合集与分节，封面为本地合成图片；未上传或投稿。";
     }
     private void LoadPreset()
     {
         title.Text = state.Preset.TitleTemplate; tags.Text = state.Preset.Tags; desc.Text = state.Preset.Description;
         source.Text = state.Preset.Source; copyright.SelectedIndex = state.Preset.Copyright == 2 ? 1 : 0;
         source.Enabled = copyright.SelectedIndex == 1; retries.Value = Math.Clamp(state.Preset.Retries, 0, 5);
+        category.Items.Clear();
         if (state.Preset.CategoryId > 0) { category.Items.Add(new Category(state.Preset.CategoryId, state.Preset.CategoryName)); category.SelectedIndex = 0; }
+        SetCoverPath(state.Preset.CoverPath, tolerateInvalid: true);
+        SetSeasonChoices([], state.Preset.SeasonId, state.Preset.SeasonTitle, state.Preset.SectionId, state.Preset.SectionTitle, state.Preset.SeasonOwnerMid);
+        if (state.Preset.SeasonId > 0) seasonStatus.Text = "已恢复保存的合集，登录后刷新可核对可用状态。";
     }
     private PublishPreset ReadPreset() => new() { TitleTemplate = title.Text.Trim(), Tags = tags.Text.Trim(), Description = desc.Text,
         CategoryId = (category.SelectedItem as Category)?.Id ?? 0, CategoryName = (category.SelectedItem as Category)?.Name ?? "",
-        Copyright = copyright.SelectedIndex == 1 ? 2 : 1, Source = source.Text.Trim(), Retries = (int)retries.Value };
+        Copyright = copyright.SelectedIndex == 1 ? 2 : 1, Source = source.Text.Trim(), Retries = (int)retries.Value,
+        CoverPath = selectedCoverPath, SeasonId = (season.SelectedItem as VideoSeason)?.Id ?? 0,
+        SeasonTitle = (season.SelectedItem as VideoSeason) is { Id: > 0 } picked ? picked.Title : "",
+        SectionId = (section.SelectedItem as SeasonSection)?.Id ?? 0,
+        SectionTitle = (section.SelectedItem as SeasonSection) is { Id: > 0 } chosen ? chosen.Title : "",
+        SeasonOwnerMid = (season.SelectedItem as VideoSeason)?.Id > 0 ? selectedSeasonOwnerMid : "" };
+    private void SelectCover()
+    {
+        using var picker = new OpenFileDialog { Title = "选择当前批次的投稿封面", Filter = "JPG / PNG 图片|*.jpg;*.jpeg;*.png", CheckFileExists = true };
+        if (picker.ShowDialog(this) != DialogResult.OK) return;
+        try { SetCoverPath(picker.FileName); }
+        catch (Exception ex) { MessageBox.Show(UposUploader.SafeMessage(ex.Message), "无法使用此封面", MessageBoxButtons.OK, MessageBoxIcon.Warning); }
+    }
+    private void SetCoverPath(string path, bool tolerateInvalid = false)
+    {
+        Bitmap? preview = null;
+        string? failure = null;
+        if (path.Length > 0)
+        {
+            try
+            {
+                using var stream = new MemoryStream(CoverImage.Read(path));
+                using var decoded = Image.FromStream(stream);
+                preview = new Bitmap(decoded);
+            }
+            catch (Exception ex) when (tolerateInvalid) { failure = UposUploader.SafeMessage(ex.Message); }
+        }
+        var previous = coverPreview.Image;
+        coverPreview.Image = preview; previous?.Dispose(); selectedCoverPath = path;
+        coverDescription.ForeColor = failure == null ? Muted : Color.Firebrick;
+        coverDescription.Text = failure != null ? "封面不可用，请重新选择或清除：" + failure
+            : path.Length == 0 ? "平台默认封面\nJPG / PNG ≤ 5 MB，至少 960×600，宽高比 4:3–16:9。"
+            : Path.GetFileName(path) + "\n" + preview!.Width + " × " + preview.Height + " · 当前批次共用";
+    }
+    private void SetSeasonChoices(IReadOnlyList<VideoSeason> choices, long wantedSeasonId = 0, string wantedSeasonTitle = "",
+        long wantedSectionId = 0, string wantedSectionTitle = "", string ownerMid = "")
+    {
+        settingSeasonChoices = true;
+        try
+        {
+            season.Items.Clear(); season.Items.Add(new VideoSeason(0, "不加入合集", []));
+            season.Items.AddRange(choices.Cast<object>().ToArray());
+            var chosen = choices.FirstOrDefault(item => item.Id == wantedSeasonId);
+            if (wantedSeasonId > 0 && chosen == null)
+            {
+                chosen = new VideoSeason(wantedSeasonId, string.IsNullOrWhiteSpace(wantedSeasonTitle) ? "保存的合集（待验证）" : wantedSeasonTitle,
+                    wantedSectionId > 0 ? [new SeasonSection(wantedSectionId, wantedSectionTitle)] : []);
+                season.Items.Add(chosen);
+            }
+            season.SelectedItem = chosen ?? season.Items[0];
+            selectedSeasonOwnerMid = chosen == null ? "" : ownerMid;
+            SetSectionChoices(chosen, wantedSectionId, wantedSectionTitle);
+        }
+        finally { settingSeasonChoices = false; }
+    }
+    private void SetSectionChoices(VideoSeason? chosen, long wantedSectionId = 0, string wantedSectionTitle = "")
+    {
+        section.Items.Clear();
+        section.Enabled = chosen?.Id > 0;
+        if (chosen == null || chosen.Id == 0)
+        { section.Items.Add(new SeasonSection(0, "无需选择分节")); section.SelectedIndex = 0; return; }
+        section.Items.AddRange(chosen.Sections.Cast<object>().ToArray());
+        var selected = chosen.Sections.FirstOrDefault(item => item.Id == wantedSectionId);
+        if (wantedSectionId > 0 && selected == null)
+        {
+            selected = new SeasonSection(wantedSectionId, string.IsNullOrWhiteSpace(wantedSectionTitle) ? "保存的分节（待验证）" : wantedSectionTitle);
+            section.Items.Add(selected);
+        }
+        if (section.Items.Count == 0) section.Items.Add(new SeasonSection(0, "无可用分节，请在创作中心管理合集"));
+        section.SelectedItem = selected ?? section.Items[0];
+    }
+    private void OnSeasonChanged()
+    {
+        if (settingSeasonChoices) return;
+        var selected = season.SelectedItem as VideoSeason;
+        selectedSeasonOwnerMid = selected?.Id > 0 ? accountId : "";
+        SetSectionChoices(selected);
+        seasonStatus.ForeColor = Muted;
+        seasonStatus.Text = selected?.Id > 0 ? "当前批次将加入此合集分节；开始前会验证账号与合集。" : "当前批次不加入合集。可在创作中心创建合集后刷新。";
+    }
+    private void ApplyAccount(JsonElement data)
+    {
+        if (!data.TryGetProperty("isLogin", out var login) || !login.GetBoolean()) throw new ApiFailure("请在下方官方页面登录。");
+        var currentAccount = data.GetProperty("mid").ToString();
+        var hasSavedSeason = (season.SelectedItem as VideoSeason)?.Id > 0;
+        if ((accountId.Length > 0 && accountId != currentAccount) || (hasSavedSeason && selectedSeasonOwnerMid != currentAccount))
+        {
+            SetSeasonChoices([]);
+            state.Preset.SeasonId = state.Preset.SectionId = 0;
+            state.Preset.SeasonTitle = state.Preset.SectionTitle = state.Preset.SeasonOwnerMid = "";
+            if (!stateReadFailed) state.Save(directory);
+            WriteLog("账号发生变化，已清除原账号的合集选择，请重新选择。 ");
+        }
+        accountId = currentAccount;
+        account.Text = "已登录 · " + data.GetProperty("uname").GetString();
+    }
+    private async Task LoadSeasonsAsync(CancellationToken token)
+    {
+        if (api == null) return;
+        var saved = ReadPreset();
+        var available = await api.GetSeasonsAsync(token);
+        token.ThrowIfCancellationRequested();
+        SetSeasonChoices(available, saved.SeasonId, saved.SeasonTitle, saved.SectionId, saved.SectionTitle, saved.SeasonOwnerMid);
+        var missing = saved.SeasonId > 0 && !available.Any(item => item.Id == saved.SeasonId && item.Sections.Any(part => part.Id == saved.SectionId));
+        seasonStatus.ForeColor = missing ? Color.Firebrick : Muted;
+        seasonStatus.Text = missing ? "保存的合集或分节已不可用，已保留原选择；请重新选择，或明确选择“不加入合集”。"
+            : available.Count == 0 ? "账号暂无可用合集，或尚未开通合集权限；可在创作中心检查。"
+            : "已读取 " + available.Count + " 个合集，当前批次将使用所选合集和分节。";
+    }
+    private async Task RefreshSeasonsAsync()
+    {
+        if (api == null || busyAccount || busySeasons || runCancel != null || stateReadFailed) return;
+        busySeasons = true; UpdateAvailability();
+        seasonStatus.Text = "正在读取账号与已有合集…";
+        try
+        {
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token); timeout.CancelAfter(TimeSpan.FromSeconds(60));
+            var nav = await api.AccountAsync(timeout.Token); UposUploader.CheckCode(nav);
+            ApplyAccount(nav.GetProperty("data"));
+            await LoadSeasonsAsync(timeout.Token);
+            WriteLog(seasonStatus.Text);
+        }
+        catch (Exception ex) when (!closing && !IsDisposed)
+        {
+            seasonStatus.ForeColor = Color.Firebrick;
+            seasonStatus.Text = "合集读取失败，已保留原选择：" + UposUploader.SafeMessage(ex.Message);
+            WriteLog(seasonStatus.Text);
+        }
+        catch (Exception) when (closing || IsDisposed) { }
+        finally { busySeasons = false; if (!IsDisposed) UpdateAvailability(); }
+    }
     private void SavePreset()
     {
         if (stateReadFailed) return;
@@ -280,7 +541,7 @@ public sealed class MainForm : Form
     private void RemoveSelected()
     {
         var j = Selected(); if (j == null || runner?.Running == true) return;
-        if (j.State == "待核对") { MessageBox.Show("请先核对投稿结果后再移除。", Text); return; }
+        if (j.State is "待核对" or "合集待核对") { MessageBox.Show("请先核对投稿或合集结果后再移除。", Text); return; }
         state.Jobs.Remove(j); state.Save(directory); RefreshRows(); UpdatePreview();
     }
     private void RefreshRows()
@@ -311,16 +572,14 @@ public sealed class MainForm : Form
     }
     private async Task RefreshAccountAsync(bool notify = true)
     {
-        if (busyAccount || api == null || runner?.Running == true) return;
-        busyAccount = true; refresh.Enabled = false;
+        if (busyAccount || busySeasons || api == null || runCancel != null) return;
+        busyAccount = true; UpdateAvailability();
         try
         {
-            using var timeout = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+            using var timeout = CancellationTokenSource.CreateLinkedTokenSource(lifetime.Token); timeout.CancelAfter(TimeSpan.FromSeconds(60));
             var nav = await api.AccountAsync(timeout.Token); UposUploader.CheckCode(nav);
             var data = nav.GetProperty("data");
-            if (!data.TryGetProperty("isLogin", out var login) || !login.GetBoolean()) throw new ApiFailure("请在下方官方页面登录。");
-            accountId = data.GetProperty("mid").ToString();
-            account.Text = "已登录 · " + data.GetProperty("uname").GetString();
+            ApplyAccount(data);
             var pre = await api.CategoriesAsync(timeout.Token); UposUploader.CheckCode(pre);
             var categories = BiliApi.ParseCategories(pre.GetProperty("data"));
             if (categories.Count == 0) throw new ApiFailure("未读取到投稿分区，请稍后重试。");
@@ -328,19 +587,31 @@ public sealed class MainForm : Form
             category.Items.Clear(); category.Items.AddRange(categories.Cast<object>().ToArray());
             category.SelectedItem = categories.FirstOrDefault(c => c.Id == selected);
             WriteLog("登录成功，已读取 " + categories.Count + " 个可用分区。");
+            try { await LoadSeasonsAsync(timeout.Token); }
+            catch (Exception ex) when (!closing && !IsDisposed)
+            {
+                seasonStatus.ForeColor = Color.Firebrick;
+                seasonStatus.Text = "合集读取失败，已保留原选择：" + UposUploader.SafeMessage(ex.Message);
+                WriteLog(seasonStatus.Text);
+            }
         }
-        catch (Exception ex)
+        catch (Exception ex) when (!closing && !IsDisposed)
         {
             accountId = ""; account.Text = "请登录并读取分区";
             if (notify) WriteLog(UposUploader.SafeMessage(ex.Message));
         }
-        finally { busyAccount = false; refresh.Enabled = true; }
+        catch (Exception) when (closing || IsDisposed) { }
+        finally { busyAccount = false; if (!IsDisposed) UpdateAvailability(); }
     }
     private async Task StartAsync()
     {
-        if (stateReadFailed || runner == null || api == null || uploader == null || runner.Running) return;
+        if (stateReadFailed || busyAccount || busySeasons || runCancel != null || runner == null || api == null || uploader == null || runner.Running) return;
         if (accountId.Length == 0) { ShowAccount(BiliApi.MemberHome); WriteLog("请先登录并读取账号与分区。"); return; }
         var preset = ReadPreset(); var originalAccount = accountId;
+        if (preset.SeasonId > 0 && preset.SeasonOwnerMid != originalAccount)
+        { WriteLog("合集所属账号与当前账号不一致，请刷新后重新选择合集。"); tabs.SelectedIndex = 1; return; }
+        if (state.Jobs.Any(job => job.State is "合集待处理" or "合集待核对" && job.Preset is { SeasonId: > 0 } saved && saved.SeasonOwnerMid != originalAccount))
+        { WriteLog("队列中有其他账号的合集任务，请先切换回对应账号再继续。"); return; }
         runCancel = new(); paused = false; uploader.PauseRequested = false;
         ToggleRunning(true);
         try
@@ -351,23 +622,34 @@ public sealed class MainForm : Form
                 var nav = await api.AccountAsync(token); UposUploader.CheckCode(nav);
                 if (!nav.TryGetProperty("data", out var data) || !data.TryGetProperty("mid", out var mid) || mid.ToString() != originalAccount)
                     throw new ApiFailure("账号发生变化或登录失效，队列已停止。");
+                if (preset.SeasonId > 0 && preset.SeasonOwnerMid != mid.ToString())
+                    throw new ApiFailure("合集所属账号与当前账号不一致，队列已停止。");
+                if (state.Jobs.Any(job => job.State is "合集待处理" or "合集待核对" && job.Preset is { SeasonId: > 0 } saved && saved.SeasonOwnerMid != mid.ToString()))
+                    throw new ApiFailure("合集任务所属账号与当前账号不一致，队列已停止。");
             }, runCancel.Token);
         }
         catch (OperationCanceledException) { WriteLog("队列已停止。"); }
         catch (Exception ex) { WriteLog(UposUploader.SafeMessage(ex.Message)); MessageBox.Show(UposUploader.SafeMessage(ex.Message), Text); }
         finally
         {
-            ToggleRunning(false); runCancel.Dispose(); runCancel = null; speed.Text = "0 B/s"; remaining.Text = "剩余时间 —";
+            runCancel.Dispose(); runCancel = null; ToggleRunning(false); speed.Text = "0 B/s"; remaining.Text = "剩余时间 —";
             RefreshRows(); if (closing) Close();
         }
     }
     private void ToggleRunning(bool running)
     {
-        start.Enabled = add.Enabled = remove.Enabled = settings.Enabled = refresh.Enabled = !running;
+        UpdateAvailability();
         pause.Enabled = stop.Enabled = running; browser.Enabled = !running;
         pause.Text = "暂停";
         tabs.Selecting -= PreventAccountTab;
         if (running) tabs.Selecting += PreventAccountTab;
+    }
+    private void UpdateAvailability()
+    {
+        var running = runCancel != null || runner?.Running == true;
+        var reading = busyAccount || busySeasons;
+        start.Enabled = add.Enabled = remove.Enabled = settings.Enabled = !running && !reading && !stateReadFailed;
+        refresh.Enabled = refreshSeasons.Enabled = !running && !reading;
     }
     private void PreventAccountTab(object? sender, TabControlCancelEventArgs e) { if (e.TabPageIndex == 2) e.Cancel = true; }
     private void TogglePause()
@@ -380,7 +662,7 @@ public sealed class MainForm : Form
     {
         if (IsDisposed || closing) return;
         // Posting progress after completion must not overwrite the confirmed job state.
-        if (job.State is "已投稿" or "投稿中" or "待核对" or "失败" or "已停止" or "已上传") return;
+        if (job.State is "已投稿" or "投稿中" or "待核对" or "失败" or "已停止" or "已上传" or "加入合集中" or "合集待处理" or "合集待核对") return;
         job.State = p.Stage.StartsWith("分片重试") ? "上传中" : p.Stage;
         var sent = Math.Min(p.Total, p.Confirmed + p.InFlight);
         if (rows.TryGetValue(job.Id, out var row)) { row.Cells[2].Value = $"{100.0 * sent / Math.Max(1, p.Total):0.0}%"; row.Cells[3].Value = p.Stage; }
@@ -394,7 +676,16 @@ public sealed class MainForm : Form
     private void ReviewSelected()
     {
         if (runner?.Running == true) return;
-        var job = Selected(); if (job?.State != "待核对") { WriteLog("所选视频无需核对。"); return; }
+        var job = Selected();
+        if (job?.State == "合集待核对")
+        {
+            var seasonAnswer = MessageBox.Show("此稿件已经投稿成功，请先在创作中心核对是否已加入目标合集。\n本操作只处理合集状态，不会重新投稿视频。\n\n是：确认已加入合集，标记完成。\n否：确认未加入合集，允许再次尝试加入。\n取消：保持合集待核对。", "核对合集结果", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
+            if (seasonAnswer == DialogResult.Cancel) return;
+            if (seasonAnswer == DialogResult.Yes) { job.State = "已投稿"; job.SeasonAdded = true; job.Error = "用户已核对稿件加入合集成功。"; }
+            else { job.State = "合集待处理"; job.SeasonAttempted = false; job.SeasonAdded = false; job.Error = "用户确认尚未加入合集，允许仅重试加入合集。"; }
+            state.Save(directory); RefreshRows(); return;
+        }
+        if (job?.State != "待核对") { WriteLog("所选视频无需核对。"); return; }
         var answer = MessageBox.Show("请先在创作中心核对。\n\n是：已确认投稿成功，标记已处理。\n否：已确认没有投稿，允许重新提交。\n取消：保持待核对。", "核对结果", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
         if (answer == DialogResult.Cancel) return;
         if (answer == DialogResult.Yes) { job.State = "已投稿"; job.Error = "用户已在创作中心核对。"; }
@@ -415,6 +706,7 @@ public sealed class MainForm : Form
             if (!closing && MessageBox.Show("队列仍在运行。关闭将停止剩余上传；已发出的投稿请求会保留核对状态。", Text, MessageBoxButtons.OKCancel) != DialogResult.OK) { e.Cancel = true; return; }
             closing = true; e.Cancel = true; runCancel?.Cancel(); return;
         }
-        timer.Stop(); http?.Dispose(); browser.Dispose();
+        closing = true; lifetime.Cancel();
+        timer.Stop(); http?.Dispose(); coverPreview.Image?.Dispose(); coverPreview.Image = null; browser.Dispose(); lifetime.Dispose();
     }
 }

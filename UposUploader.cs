@@ -53,8 +53,16 @@ public sealed class UposUploader(IBiliApi api, HttpClient client)
     }
     public static void CheckCode(JsonElement data)
     {
-        if (data.TryGetProperty("code", out var code) && code.ToString() != "0")
-            throw new ApiFailure($"Bilibili 返回 {code}：{SafeMessage(Text(data, "message"))}");
+        if (!data.TryGetProperty("code", out _)) return; // UPOS operations use their own OK field.
+        if (!TryReadCode(data, out var code)) throw new ApiFailure("平台返回了无法识别的状态码。");
+        if (code != 0) throw new ApiFailure($"Bilibili 返回 {code}：{SafeMessage(Text(data, "message"))}");
+    }
+    private static bool TryReadCode(JsonElement data, out int code)
+    {
+        code = 0;
+        if (data.ValueKind != JsonValueKind.Object || !data.TryGetProperty("code", out var value)) return false;
+        return value.ValueKind == JsonValueKind.Number ? value.TryGetInt32(out code) :
+            value.ValueKind == JsonValueKind.String && int.TryParse(value.GetString(), NumberStyles.AllowLeadingSign, CultureInfo.InvariantCulture, out code);
     }
     public static string SafeMessage(string value)
     {
@@ -180,10 +188,66 @@ public sealed class UposUploader(IBiliApi api, HttpClient client)
             $"output=json&name={Escape(Path.GetFileName(job.Path))}&profile=ugcupos%2Fbup&uploadId={Escape(uploadId)}&biz_id={Escape(bizId)}"),
             auth, new { parts = Enumerable.Range(1, chunks).Select(n => new { partNumber = n, eTag = "etag" }).ToArray() }, token);
         if (!complete.TryGetProperty("OK", out var done) || done.ToString() != "1") throw new ApiFailure("服务器尚未确认合并完成，未提交投稿。");
-        return new(Path.GetFileNameWithoutExtension(uri.AbsolutePath));
+        return new(Path.GetFileNameWithoutExtension(uri.AbsolutePath), long.TryParse(bizId, out var cid) ? cid : 0);
     }
 
-    public async Task<(long Aid, string Bvid)> PublishAsync(UploadJob job, CancellationToken token)
+    public async Task ValidateSeasonAsync(PublishPreset preset, CancellationToken token)
+    {
+        if (preset.SeasonId == 0) return;
+        var seasons = await api.GetSeasonsAsync(token);
+        var season = seasons.FirstOrDefault(s => s.Id == preset.SeasonId);
+        if (season == null || !season.Sections.Any(s => s.Id == preset.SectionId))
+            throw new ApiFailure("所选合集或分节已不存在、不可用或不属于当前账号。请刷新合集并重新选择。");
+    }
+
+    public async Task<string> UploadCoverAsync(byte[] image, CancellationToken token)
+    {
+        var response = await api.UploadCoverAsync("data:image/jpeg;base64," + Convert.ToBase64String(image), token);
+        if (response.ValueKind != JsonValueKind.Object || !response.TryGetProperty("code", out _))
+            throw new ApiFailure("封面上传响应无法识别，未提交投稿。");
+        CheckCode(response);
+        if (!response.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object ||
+            !data.TryGetProperty("url", out var value) || value.ValueKind != JsonValueKind.String)
+            throw new ApiFailure("封面上传未返回图片地址，未提交投稿。");
+        return ValidateCoverUrl(value.GetString()!);
+    }
+
+    public static string ValidateCoverUrl(string url)
+    {
+        if (url.StartsWith("//")) url = "https:" + url;
+        if (url.StartsWith("http://", StringComparison.OrdinalIgnoreCase)) url = "https://" + url[7..];
+        if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || uri.Scheme != "https" ||
+            !uri.IsDefaultPort || uri.UserInfo.Length > 0 || uri.Fragment.Length > 0 || uri.Query.Length > 0 ||
+            !(uri.Host.EndsWith(".hdslb.com", StringComparison.OrdinalIgnoreCase) || uri.Host.EndsWith(".biliimg.com", StringComparison.OrdinalIgnoreCase)) ||
+            !uri.AbsolutePath.StartsWith("/bfs/archive/", StringComparison.Ordinal) || uri.AbsolutePath.Length <= 13)
+            throw new ApiFailure("封面上传返回了非预期的图片地址，未提交投稿。");
+        return uri.AbsoluteUri;
+    }
+
+    public async Task<long> ReadArchiveCidAsync(long aid, CancellationToken token)
+    {
+        var response = await api.ArchiveAsync(aid, token);
+        CheckCode(response);
+        if (!response.TryGetProperty("code", out _) || !response.TryGetProperty("data", out var data) ||
+            !data.TryGetProperty("videos", out var videos) || videos.ValueKind != JsonValueKind.Array || videos.GetArrayLength() != 1 ||
+            !videos[0].TryGetProperty("cid", out var value) || !long.TryParse(value.ToString(), out var cid) || cid <= 0)
+            throw new ApiFailure("未读取到稿件的视频编号。稿件已投稿，稍后点击开始仅重试加入合集。");
+        return cid;
+    }
+
+    public async Task AddToSeasonAsync(UploadJob job, CancellationToken token)
+    {
+        if (job.Aid <= 0 || job.Cid <= 0 || job.Preset?.SectionId is not > 0)
+            throw new ApiFailure("加入合集所需的稿件信息不完整，请在创作中心核对。");
+        JsonElement response;
+        try { response = await api.AddToSeasonAsync(job.Preset.SectionId, job.Aid, job.Cid, job.Title, token); }
+        catch { throw new SeasonUncertain("稿件已投稿，但加入合集结果未知。请在创作中心核对合集后操作；不会再次投稿。"); }
+        if (!TryReadCode(response, out _))
+            throw new SeasonUncertain("稿件已投稿，但加入合集响应无法识别。请在创作中心核对合集。");
+        CheckCode(response);
+    }
+
+    public async Task<(long Aid, string Bvid)> PublishAsync(UploadJob job, CancellationToken token, string coverUrl = "")
     {
         var p = job.Preset ?? throw new InvalidOperationException("没有投稿预设。");
         if (string.IsNullOrWhiteSpace(job.RemoteFilename)) throw new InvalidOperationException("视频还没有上传完成。");
@@ -191,14 +255,14 @@ public sealed class UposUploader(IBiliApi api, HttpClient client)
         {
             copyright = p.Copyright, source = p.Copyright == 2 ? p.Source : "", title = job.Title,
             tid = p.CategoryId, tag = string.Join(',', p.TagList()), desc_format_id = 0, desc = p.Description,
-            dynamic = "", cover = "", no_reprint = p.Copyright == 1 ? 1 : 0, open_elec = 0,
+            dynamic = "", cover = coverUrl.Length > 0 ? ValidateCoverUrl(coverUrl) : "", no_reprint = p.Copyright == 1 ? 1 : 0, open_elec = 0,
             videos = new[] { new { filename = job.RemoteFilename, title = job.Title, desc = "" } }
         };
         JsonElement response;
         try { response = await api.PublishAsync(payload, token); }
         catch { throw new PublishUncertain("投稿请求结果未知。请到创作中心核对后再操作，客户端不会自动重发。"); }
         // A nonzero reply is an explicit rejection, unlike a lost response.
-        if (response.ValueKind != JsonValueKind.Object || !response.TryGetProperty("code", out _))
+        if (!TryReadCode(response, out _))
             throw new PublishUncertain("投稿响应无法识别，请到创作中心核对。");
         CheckCode(response);
         if (!response.TryGetProperty("data", out var data) || !long.TryParse(Text(data, "aid"), out var aid) || aid <= 0)

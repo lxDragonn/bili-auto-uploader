@@ -5,6 +5,9 @@ using System.Text.RegularExpressions;
 namespace BilibiliUploader;
 
 public sealed record Category(int Id, string Name) { public override string ToString() => Name; }
+public sealed record SeasonSection(long Id, string Title) { public override string ToString() => Title; }
+public sealed record VideoSeason(long Id, string Title, IReadOnlyList<SeasonSection> Sections)
+{ public override string ToString() => Title; }
 public sealed class PublishPreset
 {
     public const string ReplayTitleTemplate = "【直播回放{record_date:yyyy.M.d}】{title}";
@@ -18,6 +21,12 @@ public sealed class PublishPreset
     public int Copyright { get; set; } = 1;
     public string Source { get; set; } = "";
     public int Retries { get; set; } = 2;
+    public string CoverPath { get; set; } = "";
+    public long SeasonId { get; set; }
+    public string SeasonTitle { get; set; } = "";
+    public long SectionId { get; set; }
+    public string SectionTitle { get; set; } = "";
+    public string SeasonOwnerMid { get; set; } = "";
     public string Title(string path, int index, DateTime time)
     {
         if (Variables.Replace(TitleTemplate, "").IndexOfAny(['{', '}']) >= 0)
@@ -55,6 +64,9 @@ public sealed class PublishPreset
         if (Copyright is not (1 or 2) || (Copyright == 2 && string.IsNullOrWhiteSpace(Source))) throw new InvalidOperationException("转载视频必须填写来源。");
         if (Source.Length > 200) throw new InvalidOperationException("转载来源不能超过 200 个字符。");
         if (Retries is < 0 or > 5) throw new InvalidOperationException("分片重试次数须在 0–5 之间。");
+        if (SeasonId < 0 || SectionId < 0 || (SeasonId == 0 && SectionId != 0) ||
+            (SeasonId > 0 && (SectionId == 0 || !Regex.IsMatch(SeasonOwnerMid, @"\A[0-9]+\z"))))
+            throw new InvalidOperationException("请登录后重新读取合集并选择分节，或选择不加入合集。");
     }
     public PublishPreset Copy() => JsonSerializer.Deserialize<PublishPreset>(JsonSerializer.Serialize(this))!;
 }
@@ -70,6 +82,9 @@ public sealed class UploadJob
     public string Error { get; set; } = "";
     public string Bvid { get; set; } = "";
     public long Aid { get; set; }
+    public long Cid { get; set; }
+    public bool SeasonAttempted { get; set; }
+    public bool SeasonAdded { get; set; }
     public string RemoteFilename { get; set; } = "";
     public PublishPreset? Preset { get; set; }
     public long ConfirmedBytes { get; set; }
@@ -105,8 +120,14 @@ public sealed class LocalState
         foreach (var j in state.Jobs)
         {
             if (j.State == "已投稿" || j.State == "已跳过") continue;
+            if (j.Aid > 0 && j.Preset?.SeasonId > 0)
+            {
+                j.State = j.SeasonAdded ? "已投稿" : j.SeasonAttempted ? "合集待核对" : "合集待处理";
+                j.Error = j.SeasonAttempted && !j.SeasonAdded ? "稿件已投稿；上次加入合集结果未知，请在创作中心核对。" : "稿件已投稿，开始后只处理加入合集。";
+                continue;
+            }
             if (j.PublishAttempted) { j.State = "待核对"; j.Error = "上次已发出投稿请求，请先到创作中心核对，避免重复投稿。"; }
-            else if (j.State is "上传中" or "准备上传" or "合并中" or "暂停中")
+            else if (j.State is "上传中" or "准备上传" or "合并中" or "暂停中" or "上传封面")
             { j.State = "等待上传"; j.ConfirmedBytes = 0; j.Error = "上次传输已中断，开始后重新上传。"; }
         }
         return state;
@@ -127,10 +148,15 @@ public sealed class LocalState
 
 public sealed class ApiFailure(string message) : Exception(message);
 public sealed class PublishUncertain(string message) : Exception(message);
+public sealed class SeasonUncertain(string message) : Exception(message);
 public sealed record UploadProgress(long Confirmed, long InFlight, long Total, double Speed, string Stage);
-public sealed record UploadedVideo(string Filename);
+public sealed record UploadedVideo(string Filename, long Cid = 0);
 public interface IBiliApi
 {
     Task<JsonElement> PreUploadAsync(string name, long size, CancellationToken token);
     Task<JsonElement> PublishAsync(object payload, CancellationToken token);
+    Task<JsonElement> UploadCoverAsync(string dataUrl, CancellationToken token);
+    Task<IReadOnlyList<VideoSeason>> GetSeasonsAsync(CancellationToken token);
+    Task<JsonElement> AddToSeasonAsync(long sectionId, long aid, long cid, string title, CancellationToken token);
+    Task<JsonElement> ArchiveAsync(long aid, CancellationToken token);
 }
