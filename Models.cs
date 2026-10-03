@@ -8,6 +8,9 @@ public sealed record Category(int Id, string Name) { public override string ToSt
 public sealed record SeasonSection(long Id, string Title) { public override string ToString() => Title; }
 public sealed record VideoSeason(long Id, string Title, IReadOnlyList<SeasonSection> Sections)
 { public override string ToString() => Title; }
+public sealed record ExistingArchive(long Aid, string Bvid, string Title, int PartCount = 0)
+{ public override string ToString() => $"{Title}  ·  {Bvid}  ·  {PartCount} P"; }
+public sealed record ArchivePage(IReadOnlyList<ExistingArchive> Items, int Page, bool HasMore);
 public sealed class PublishPreset
 {
     public const string ReplayTitleTemplate = "【直播回放{record_date:yyyy.M.d}】{title}";
@@ -27,6 +30,11 @@ public sealed class PublishPreset
     public long SectionId { get; set; }
     public string SectionTitle { get; set; } = "";
     public string SeasonOwnerMid { get; set; } = "";
+    public bool AppendToExisting { get; set; }
+    public long TargetAid { get; set; }
+    public string TargetBvid { get; set; } = "";
+    public string TargetTitle { get; set; } = "";
+    public string TargetOwnerMid { get; set; } = "";
     public string Title(string path, int index, DateTime time)
     {
         if (Variables.Replace(TitleTemplate, "").IndexOfAny(['{', '}']) >= 0)
@@ -57,13 +65,19 @@ public sealed class PublishPreset
     {
         var title = Title(path, index, DateTime.Now);
         if (string.IsNullOrWhiteSpace(title) || title.Length > 80) throw new InvalidOperationException("展开后的标题须为 1–80 个字符，请调整标题模板。");
+        if (Retries is < 0 or > 5) throw new InvalidOperationException("分片重试次数须在 0–5 之间。");
+        if (AppendToExisting)
+        {
+            if (TargetAid <= 0 || !Regex.IsMatch(TargetOwnerMid, @"\A[0-9]+\z"))
+                throw new InvalidOperationException("请登录并选择要追加分 P 的已有投稿。");
+            return; // Global metadata belongs to the existing archive, not the new-part preset.
+        }
         if (CategoryId <= 0) throw new InvalidOperationException("请登录后读取分区并选择投稿分区。");
         var tags = TagList();
         if (tags.Length is < 1 or > 10 || tags.Any(t => t.Length > 20)) throw new InvalidOperationException("请填写 1–10 个标签，以逗号分隔，每个不超过 20 个字符。");
         if (Description.Length > 2000) throw new InvalidOperationException("简介不能超过 2000 个字符。");
         if (Copyright is not (1 or 2) || (Copyright == 2 && string.IsNullOrWhiteSpace(Source))) throw new InvalidOperationException("转载视频必须填写来源。");
         if (Source.Length > 200) throw new InvalidOperationException("转载来源不能超过 200 个字符。");
-        if (Retries is < 0 or > 5) throw new InvalidOperationException("分片重试次数须在 0–5 之间。");
         if (SeasonId < 0 || SectionId < 0 || (SeasonId == 0 && SectionId != 0) ||
             (SeasonId > 0 && (SectionId == 0 || !Regex.IsMatch(SeasonOwnerMid, @"\A[0-9]+\z"))))
             throw new InvalidOperationException("请登录后重新读取合集并选择分节，或选择不加入合集。");
@@ -89,6 +103,8 @@ public sealed class UploadJob
     public PublishPreset? Preset { get; set; }
     public long ConfirmedBytes { get; set; }
     public bool PublishAttempted { get; set; }
+    public bool AppendAttempted { get; set; }
+    public long[] AppendOriginalCids { get; set; } = [];
     public static UploadJob Create(string path)
     {
         var f = new FileInfo(System.IO.Path.GetFullPath(path));
@@ -119,7 +135,12 @@ public sealed class LocalState
         state.Jobs = state.Jobs.Take(200).ToList();
         foreach (var j in state.Jobs)
         {
-            if (j.State == "已投稿" || j.State == "已跳过") continue;
+            if (j.State is "已投稿" or "已跳过" or "已追加") continue;
+            if (j.AppendAttempted)
+            {
+                j.State = "追加待核对"; j.Error = "上次已发出追加分 P 请求，请先核对原稿件的分 P，避免重复追加。";
+                continue;
+            }
             if (j.Aid > 0 && j.Preset?.SeasonId > 0)
             {
                 j.State = j.SeasonAdded ? "已投稿" : j.SeasonAttempted ? "合集待核对" : "合集待处理";
@@ -149,6 +170,7 @@ public sealed class LocalState
 public sealed class ApiFailure(string message) : Exception(message);
 public sealed class PublishUncertain(string message) : Exception(message);
 public sealed class SeasonUncertain(string message) : Exception(message);
+public sealed class AppendUncertain(string message) : Exception(message);
 public sealed record UploadProgress(long Confirmed, long InFlight, long Total, double Speed, string Stage);
 public sealed record UploadedVideo(string Filename, long Cid = 0);
 public interface IBiliApi
@@ -159,4 +181,6 @@ public interface IBiliApi
     Task<IReadOnlyList<VideoSeason>> GetSeasonsAsync(CancellationToken token);
     Task<JsonElement> AddToSeasonAsync(long sectionId, long aid, long cid, string title, CancellationToken token);
     Task<JsonElement> ArchiveAsync(long aid, CancellationToken token);
+    Task<JsonElement> ArchiveDetailAsync(long aid, CancellationToken token);
+    Task<JsonElement> EditArchiveAsync(object payload, CancellationToken token);
 }

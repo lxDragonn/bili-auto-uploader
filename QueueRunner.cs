@@ -8,14 +8,17 @@ public sealed class QueueRunner(LocalState state, string directory, UposUploader
     public async Task RunAsync(PublishPreset preset, Func<CancellationToken, Task> verifyAccount, CancellationToken token)
     {
         if (Running) throw new InvalidOperationException("队列正在运行。");
-        if (state.Jobs.Any(j => j.State is "待核对" or "合集待核对")) throw new InvalidOperationException("请先核对上次结果未知的投稿或合集操作。");
+        if (state.Jobs.Any(j => j.State is "待核对" or "合集待核对" or "追加待核对")) throw new InvalidOperationException("请先核对上次结果未知的投稿、分 P 或合集操作。");
         var pending = state.Jobs.Where(j => j.State is "等待上传" or "失败" or "已停止" or "已上传" or "合集待处理").ToList();
         if (pending.Count == 0) throw new InvalidOperationException("请先添加视频。");
-        // Freeze the chosen image before any upload, just like the batch preset.
-        var cover = !pending.Any(j => j.Aid == 0) || string.IsNullOrWhiteSpace(preset.CoverPath) ? null : CoverImage.Read(preset.CoverPath);
-        var coverUrl = "";
         foreach (var job in pending)
         {
+            if (job.Preset?.AppendToExisting == true)
+            {
+                job.Preset.Validate(job.Path, state.Jobs.IndexOf(job) + 1);
+                if (job.RemoteFilename.Length == 0) job.VerifyFile();
+                continue; // Never retarget a stopped or rejected append job to a different archive.
+            }
             // A published video keeps its original collection target and never re-enters publishing.
             if (job.Aid > 0)
             {
@@ -29,6 +32,9 @@ public sealed class QueueRunner(LocalState state, string directory, UposUploader
             job.Preset = preset.Copy(); job.Title = preset.Title(job.Path, index, DateTime.Now);
             job.Error = "";
         }
+        // Covers apply only to new archives, not to the existing archive's global metadata.
+        var cover = !pending.Any(j => j.Aid == 0 && !j.Preset!.AppendToExisting) || string.IsNullOrWhiteSpace(preset.CoverPath) ? null : CoverImage.Read(preset.CoverPath);
+        var coverUrl = "";
         state.Save(directory);
         Running = true;
         try
@@ -36,6 +42,11 @@ public sealed class QueueRunner(LocalState state, string directory, UposUploader
             foreach (var job in pending)
             {
                 token.ThrowIfCancellationRequested();
+                if (job.Preset!.AppendToExisting)
+                {
+                    if (!await AppendAsync(job, verifyAccount, token)) break;
+                    continue;
+                }
                 if (job.Aid > 0)
                 {
                     if (!await CompleteSeasonAsync(job, verifyAccount, token)) break;
@@ -90,6 +101,67 @@ public sealed class QueueRunner(LocalState state, string directory, UposUploader
             }
         }
         finally { Running = false; }
+    }
+    private async Task<bool> AppendAsync(UploadJob job, Func<CancellationToken, Task> verifyAccount, CancellationToken token)
+    {
+        try
+        {
+            await uploader.WaitForResumeAsync(token);
+            await verifyAccount(token);
+            var before = await uploader.ReadAppendArchiveAsync(job.Preset!, token);
+            if (job.Cid > 0 && before.Cids.Contains(job.Cid))
+            {
+                if (!before.Confirms(job.Cid, job.AppendOriginalCids)) throw new AppendUncertain("新分 P 已存在，但原分 P 顺序已变化，请核对原稿件。");
+                FinishAppend(job, before); return true;
+            }
+            before.EnsureCanAppend();
+            if (job.RemoteFilename.Length == 0)
+            {
+                job.State = "准备上传"; Persist(job);
+                IProgress<UploadProgress> progress = new Progress<UploadProgress>(p => Progressed?.Invoke(job, p));
+                var uploaded = await uploader.UploadAsync(job, job.Preset!, p => progress.Report(p), token);
+                job.RemoteFilename = uploaded.Filename; job.Cid = uploaded.Cid;
+                job.State = "已上传"; job.ConfirmedBytes = job.Size; Persist(job);
+            }
+            await uploader.WaitForResumeAsync(token);
+            await verifyAccount(token);
+            var current = await uploader.ReadAppendArchiveAsync(job.Preset!, token);
+            if (current.Cids.Contains(job.Cid))
+            {
+                if (!current.Confirms(job.Cid, job.AppendOriginalCids)) throw new AppendUncertain("新分 P 已存在，但原分 P 顺序已变化，请核对原稿件。");
+                FinishAppend(job, current); return true;
+            }
+            var payload = current.Append(job);
+            var check = await uploader.ReadAppendArchiveAsync(job.Preset!, token);
+            check.EnsureCanAppend();
+            if (!current.SameContent(check)) throw new ApiFailure("提交前检测到原稿件被修改，已停止追加。请关闭其他编辑窗口后再开始。");
+            token.ThrowIfCancellationRequested();
+            job.AppendOriginalCids = current.Cids; job.AppendAttempted = true; job.State = "追加分P中"; Persist(job);
+            try { await uploader.EditArchiveAsync(payload, token); }
+            catch (ApiFailure) { job.AppendAttempted = false; throw; } // Only a definite rejection permits another edit.
+            // A successful edit reply is not enough: observe the new part before the next edit.
+            for (var attempt = 0; attempt < 4; attempt++)
+            {
+                if (attempt > 0) await Task.Delay(TimeSpan.FromSeconds(2), token);
+                var updated = await uploader.ReadAppendArchiveAsync(job.Preset!, token);
+                if (updated.Confirms(job.Cid, job.AppendOriginalCids)) { FinishAppend(job, updated); return true; }
+            }
+            throw new AppendUncertain("服务器已接收追加请求，但尚未确认完整分 P 列表。请在创作中心核对后继续。");
+        }
+        catch (AppendUncertain ex) { job.State = "追加待核对"; job.Error = ex.Message; }
+        catch (Exception ex)
+        {
+            job.State = job.AppendAttempted ? "追加待核对" : token.IsCancellationRequested ? "已停止" : "失败";
+            job.Error = job.AppendAttempted ? "追加请求已发出，但结果核对未完成。请先在创作中心检查分 P。" :
+                token.IsCancellationRequested ? "追加任务已停止，已上传的视频及原目标会保留。" : UposUploader.SafeMessage(ex.Message);
+        }
+        Persist(job); return false;
+    }
+    private void FinishAppend(UploadJob job, ArchiveAppend archive)
+    {
+        job.Aid = archive.Aid; job.Bvid = archive.Bvid.Length > 0 ? archive.Bvid : job.Preset!.TargetBvid;
+        job.State = "已追加"; job.ConfirmedBytes = job.Size;
+        job.Error = "已确认新分 P 位于原稿件中；转码和审核结果请在创作中心查看。"; Persist(job);
     }
     private async Task<bool> CompleteSeasonAsync(UploadJob job, Func<CancellationToken, Task> verifyAccount, CancellationToken token)
     {

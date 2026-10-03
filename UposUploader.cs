@@ -269,6 +269,18 @@ public sealed class UposUploader(IBiliApi api, HttpClient client)
             throw new PublishUncertain("投稿响应缺少稿件编号，请到创作中心核对。");
         return (aid, Text(data, "bvid"));
     }
+
+    public async Task<ArchiveAppend> ReadAppendArchiveAsync(PublishPreset preset, CancellationToken token) =>
+        ArchiveAppend.Read(await api.ArchiveDetailAsync(preset.TargetAid, token), preset);
+
+    public async Task EditArchiveAsync(object payload, CancellationToken token)
+    {
+        JsonElement response;
+        try { response = await api.EditArchiveAsync(payload, token); }
+        catch { throw new AppendUncertain("追加分 P 请求结果未知，请在创作中心核对原稿件；不会自动重发。"); }
+        if (!TryReadCode(response, out _)) throw new AppendUncertain("追加分 P 响应无法识别，请先核对原稿件。");
+        CheckCode(response);
+    }
 }
 
 public sealed class ProgressContent(Stream source, long length, Action<int> progress) : HttpContent

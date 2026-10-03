@@ -3,6 +3,7 @@ using System.Drawing;
 using System.Drawing.Imaging;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using BilibiliUploader;
 
 static class Verify
@@ -54,6 +55,11 @@ static class Verify
         preset.SectionId = 200; preset.SectionTitle = "默认分节"; preset.SeasonOwnerMid = "12345";
         return preset;
     }
+    static PublishPreset AppendPreset() => new()
+    {
+        AppendToExisting = true, TargetAid = 5000, TargetBvid = "BVexisting", TargetTitle = "原稿标题",
+        TargetOwnerMid = "12345", TitleTemplate = "新分P-{index}"
+    };
 
     static async Task Main()
     {
@@ -522,6 +528,195 @@ static class Verify
             var dir = Path.Combine(Root, "crashed"); var st = new LocalState { Jobs = [new() { State = "投稿中", PublishAttempted = true }] };
             st.Save(dir); Check(LocalState.Load(dir).Jobs[0].State == "待核对"); return Task.CompletedTask;
         });
+        await Test("Append presets validate their target and part title without requiring new-publication metadata", () =>
+        {
+            var p = AppendPreset();
+            p.CategoryId = -1; p.Tags = ""; p.Copyright = 2; p.Source = "";
+            p.Description = new string('x', 2001); p.SeasonId = -1; p.SectionId = -1;
+            p.CoverPath = Path.Combine(Root, "nonexistent-cover.png"); p.Validate("part.mp4", 1);
+            foreach (var aid in new long[] { 0, -1 })
+            { var invalid = AppendPreset(); invalid.TargetAid = aid; Throws<InvalidOperationException>(() => invalid.Validate("part.mp4", 1)); }
+            foreach (var owner in new[] { "", "123\n", "１２３", "not-an-owner" })
+            { var invalid = AppendPreset(); invalid.TargetOwnerMid = owner; Throws<InvalidOperationException>(() => invalid.Validate("part.mp4", 1)); }
+            foreach (var title in new[] { " ", new string('x', 81), "{unknown}" })
+            { var invalid = AppendPreset(); invalid.TitleTemplate = title; Throws<InvalidOperationException>(() => invalid.Validate("part.mp4", 1)); }
+            return Task.CompletedTask;
+        });
+        await Test("Append targets survive preset copies and persisted queue restoration", () =>
+        {
+            var original = AppendPreset(); var copy = original.Copy(); original.TargetAid = 9000; original.TargetTitle = "已修改";
+            Check(copy.AppendToExisting && copy.TargetAid == 5000 && copy.TargetBvid == "BVexisting" && copy.TargetTitle == "原稿标题" && copy.TargetOwnerMid == "12345");
+            var dir = Path.Combine(Root, "append-preset"); new LocalState { Preset = copy, Jobs = [new() { Preset = copy, State = "已上传", RemoteFilename = "video", Cid = 123 }] }.Save(dir);
+            var restored = LocalState.Load(dir);
+            Check(restored.Preset.AppendToExisting && restored.Jobs[0].Preset!.TargetAid == 5000 && restored.Jobs[0].Preset!.TargetOwnerMid == "12345");
+            Check(restored.Jobs[0].Cid == 123 && !restored.Jobs[0].AppendAttempted);
+            return Task.CompletedTask;
+        });
+        await Test("Archive choices preserve exact identifiers, handle malformed entries and paginate by the server count", () =>
+        {
+            var result = BiliApi.ParseArchives(Json("""
+                {"arc_audits":[
+                 {"Archive":{"aid":9007199254740993,"bvid":"BVlarge","title":"示例稿件","videos":3}},
+                 {"archive":{"aid":9007199254740993,"bvid":"BVlarge","title":"重复","videos":3}},
+                 {"Archive":{"aid":5000,"title":"旧格式稿件","videos":1}},
+                 null,{}, {"Archive":[]}, {"Archive":{"aid":0,"title":"无效稿件"}},
+                 {"Archive":{"aid":5001,"title":null}}
+                ],"page":{"count":25}}
+                """), 2);
+            Check(result.Items.Count == 2 && result.Page == 2 && result.HasMore);
+            Check(result.Items[0].Aid == 9007199254740993 && result.Items[0].PartCount == 3 && result.Items[0].Bvid == "BVlarge");
+            Check(result.Items[1].Bvid == "av5000");
+            Check(!BiliApi.ParseArchives(Json("{\"arc_audits\":[],\"page\":{\"count\":25}}"), 3).HasMore);
+            foreach (var malformed in new[] { "null", "[]", "{}", "{\"arc_audits\":{}}" })
+                Throws<ApiFailure>(() => BiliApi.ParseArchives(Json(malformed), 1));
+            return Task.CompletedTask;
+        });
+        await Test("Appending retains the full existing part list and remote archive metadata", async () =>
+        {
+            var p = AppendPreset(); p.CoverPath = Path.Combine(Root, "missing-cover.jpg"); p.SeasonId = -1;
+            var st = new LocalState { Jobs = [Job()] }; var a = new FakeApi(); var h = new UploadHandler(); using var c = new HttpClient(h);
+            var dir = Path.Combine(Root, "append-success");
+            await new QueueRunner(st, dir, new(a, c)).RunAsync(p, _ => Task.CompletedTask, CancellationToken.None);
+            Check(st.Jobs[0].State == "已追加" && st.Jobs[0].Aid == 5000 && st.Jobs[0].Bvid == "BVexisting");
+            Check(a.Edits == 1 && a.PreUploads == 1 && h.Puts == 3 && a.Published == 0 && a.CoverUploads == 0 && a.SeasonReads == 0 && a.SeasonAdds == 0);
+            var payload = a.EditPayloads[0]; var parts = payload.GetProperty("videos");
+            Check(payload.GetProperty("aid").GetInt64() == 5000 && payload.GetProperty("title").GetString() == "原稿标题");
+            Check(payload.GetProperty("cover").GetString() == "https://i0.hdslb.com/bfs/archive/original.jpg");
+            Check(payload.GetProperty("desc").GetString() == "原稿简介" && payload.GetProperty("tag").GetString() == "原标签,示例");
+            Check(payload.GetProperty("tid").GetInt32() == 171 && payload.GetProperty("copyright").GetInt32() == 1);
+            Check(payload.GetProperty("human_type2").GetInt64() == 3 && payload.GetProperty("recreate").GetInt32() == 1);
+            Check(payload.GetProperty("is_360").GetInt32() == 0 && payload.GetProperty("dolby").GetInt64() == 1);
+            Check(payload.GetProperty("space_hidden").GetInt32() == 1 && payload.GetProperty("watermark").GetProperty("state").GetInt64() == 1);
+            Check(parts.GetArrayLength() == 3 && parts[0].GetProperty("cid").GetInt64() == 401 && parts[1].GetProperty("cid").GetInt64() == 402);
+            Check(parts[0].GetProperty("title").GetString() == "原P1" && parts[0].GetProperty("desc").GetString() == "原分P简介");
+            Check(parts[2].GetProperty("filename").GetString() == "video" && parts[2].GetProperty("title").GetString() == "新分P-1");
+            Check(a.DetailReads >= 2 && LocalState.Load(dir).Jobs[0].State == "已追加");
+            Check(!File.ReadAllText(Path.Combine(dir, "queue.json")).Contains("test-upload-secret"));
+        });
+        await Test("Consecutive append jobs re-read the archive and retain the part added by the preceding job", async () =>
+        {
+            var first = Job(); first.RemoteFilename = "first-new"; first.Cid = 123; first.State = "已上传";
+            var second = Job(); second.RemoteFilename = "second-new"; second.Cid = 124; second.State = "已上传";
+            var st = new LocalState { Jobs = [first, second] }; var a = new FakeApi(); var h = new UploadHandler(); using var c = new HttpClient(h);
+            await new QueueRunner(st, Path.Combine(Root, "append-sequential"), new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+            Check(st.Jobs.All(j => j.State == "已追加") && a.Edits == 2 && a.PreUploads == 0 && h.Requests == 0 && a.Published == 0);
+            var firstParts = a.EditPayloads[0].GetProperty("videos"); var secondParts = a.EditPayloads[1].GetProperty("videos");
+            Check(firstParts.GetArrayLength() == 3 && secondParts.GetArrayLength() == 4);
+            Check(secondParts[2].GetProperty("cid").GetInt64() == 123 && secondParts[3].GetProperty("cid").GetInt64() == 124);
+            Check(a.DetailReadsAtEdit.Count == 2 && a.DetailReadsAtEdit[1] >= a.DetailReadsAtEdit[0] + 2, "Each completed edit must be verified and the next edit must read a fresh archive");
+        });
+        await Test("A part already present by CID is completed without sending another archive edit", async () =>
+        {
+            var job = Job(); job.RemoteFilename = "old-first"; job.Cid = 401; job.State = "已上传";
+            var st = new LocalState { Jobs = [job] }; var a = new FakeApi(); var h = new UploadHandler(); using var c = new HttpClient(h);
+            await new QueueRunner(st, Path.Combine(Root, "append-existing-cid"), new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+            Check(job.State == "已追加" && a.Edits == 0 && a.Published == 0 && h.Requests == 0 && job.Aid == 5000);
+        });
+        await Test("Explicit edit rejection retries without reuploading and keeps the original target", async () =>
+        {
+            var st = new LocalState { Jobs = [Job()] }; var a = new FakeApi { RejectEdit = true }; var h = new UploadHandler(); using var c = new HttpClient(h);
+            var dir = Path.Combine(Root, "append-rejected");
+            await new QueueRunner(st, dir, new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+            Check(st.Jobs[0].State == "失败" && !st.Jobs[0].AppendAttempted && a.Edits == 1 && st.Jobs[0].RemoteFilename == "video");
+            var restored = LocalState.Load(dir); a.RejectEdit = false;
+            var changed = AppendPreset(); changed.TargetAid = 9000; changed.TargetBvid = "BVother"; changed.TargetOwnerMid = "67890"; changed.TitleTemplate = "不应用的新分P名";
+            await new QueueRunner(restored, dir, new(a, c)).RunAsync(changed, _ => Task.CompletedTask, CancellationToken.None);
+            Check(restored.Jobs[0].State == "已追加" && a.Edits == 2 && a.PreUploads == 1 && h.Puts == 3 && a.Published == 0);
+            Check(a.DetailAids.All(aid => aid == 5000) && a.EditPayloads.All(payload => payload.GetProperty("aid").GetInt64() == 5000));
+            Check(a.EditPayloads[1].GetProperty("videos")[2].GetProperty("title").GetString() == "新分P-1");
+            Check(restored.Jobs[0].Preset!.TargetOwnerMid == "12345");
+        });
+        await Test("A lost edit response stops the queue and cannot automatically repeat after restart", async () =>
+        {
+            var st = new LocalState { Jobs = [Job(), Job()] }; var a = new FakeApi { LoseEdit = true }; using var c = new HttpClient(new UploadHandler());
+            var dir = Path.Combine(Root, "append-lost");
+            await new QueueRunner(st, dir, new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+            Check(a.Edits == 1 && a.PreUploads == 1 && st.Jobs[0].State == "追加待核对" && st.Jobs[0].AppendAttempted && st.Jobs[1].State == "等待上传");
+            foreach (var state in new[] { st, LocalState.Load(dir) })
+            {
+                Check(state.Jobs[0].State == "追加待核对");
+                try { await new QueueRunner(state, dir, new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None); throw new Exception("Expected append reconciliation block"); }
+                catch (InvalidOperationException) { }
+            }
+            Check(a.Edits == 1 && a.PreUploads == 1 && a.Published == 0);
+        });
+        await Test("Malformed edit status codes require reconciliation rather than retrying a possible edit", async () =>
+        {
+            foreach (var rawCode in new[] { "null", "\"unknown\"", "0.5", "true", "{}", "2147483648" })
+            {
+                var st = new LocalState { Jobs = [Job(), Job()] }; var a = new FakeApi { EditResponse = "{\"code\":" + rawCode + "}" }; using var c = new HttpClient(new UploadHandler());
+                var dir = Path.Combine(Root, Guid.NewGuid().ToString("N"));
+                await new QueueRunner(st, dir, new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+                Check(st.Jobs[0].State == "追加待核对" && st.Jobs[0].AppendAttempted && st.Jobs[1].State == "等待上传");
+                Check(a.Edits == 1 && a.PreUploads == 1 && a.Published == 0 && LocalState.Load(dir).Jobs[0].State == "追加待核对");
+            }
+        });
+        await Test("Edit acceptance is not enough when the new CID is absent from the subsequent archive", async () =>
+        {
+            var st = new LocalState { Jobs = [Job(), Job()] }; var a = new FakeApi { KeepDetailAfterEdit = true }; using var c = new HttpClient(new UploadHandler());
+            var dir = Path.Combine(Root, "append-not-visible");
+            await new QueueRunner(st, dir, new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+            Check(a.Edits == 1 && a.PreUploads == 1 && st.Jobs[0].State == "追加待核对" && st.Jobs[1].State == "等待上传");
+            Check(LocalState.Load(dir).Jobs[0].State == "追加待核对");
+        });
+        await Test("A missing old CID after editing stops further appends even if the new CID is present", async () =>
+        {
+            var st = new LocalState { Jobs = [Job(), Job()] }; var a = new FakeApi { DropOldPartAfterEdit = true }; using var c = new HttpClient(new UploadHandler());
+            await new QueueRunner(st, Path.Combine(Root, "append-old-part-missing"), new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+            Check(a.Edits == 1 && a.PreUploads == 1 && st.Jobs[0].State == "追加待核对" && st.Jobs[1].State == "等待上传");
+        });
+        await Test("Cancellation after the edit starts preserves an append uncertainty checkpoint", async () =>
+        {
+            using var cancel = new CancellationTokenSource();
+            var st = new LocalState { Jobs = [Job(), Job()] }; var a = new FakeApi { DuringEdit = cancel.Cancel }; using var c = new HttpClient(new UploadHandler());
+            var dir = Path.Combine(Root, "append-cancel");
+            await new QueueRunner(st, dir, new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, cancel.Token);
+            Check(st.Jobs[0].State == "追加待核对" && st.Jobs[0].AppendAttempted && st.Jobs[1].State == "等待上传" && a.Edits == 1);
+            Check(LocalState.Load(dir).Jobs[0].State == "追加待核对");
+        });
+        await Test("Crash restoration prioritizes uncertain append requests over collection and publication state", () =>
+        {
+            var p = AppendPreset(); p.SeasonId = 100;
+            var dir = Path.Combine(Root, "append-crash");
+            new LocalState { Jobs = [new() { Preset = p, State = "追加中", Aid = 5000, Cid = 123, AppendAttempted = true, PublishAttempted = true }] }.Save(dir);
+            Check(LocalState.Load(dir).Jobs[0].State == "追加待核对");
+            new LocalState { Jobs = [new() { Preset = p, State = "已追加", Aid = 5000, Cid = 123, AppendAttempted = true }] }.Save(dir);
+            Check(LocalState.Load(dir).Jobs[0].State == "已追加");
+            return Task.CompletedTask;
+        });
+        await Test("Unreadable or mismatched archives never issue an edit", async () =>
+        {
+            foreach (var response in new[] { "{\"code\":-404,\"message\":\"稿件不存在\"}", "{\"code\":0,\"data\":{}}", FakeApi.GoodDetailResponse.Replace("\"aid\":5000", "\"aid\":9000"), FakeApi.GoodDetailResponse.Replace("\"mid\":12345", "\"mid\":67890") })
+            {
+                var st = new LocalState { Jobs = [Job()] }; var a = new FakeApi { DetailResponse = response }; using var c = new HttpClient(new UploadHandler());
+                await new QueueRunner(st, Path.Combine(Root, Guid.NewGuid().ToString("N")), new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+                Check(a.Edits == 0 && a.Published == 0 && st.Jobs[0].State == "失败" && !st.Jobs[0].AppendAttempted);
+            }
+        });
+        await Test("Disallowed, special and full archives stop before transferring a new part", async () =>
+        {
+            foreach (var change in new[] { ("\"can_add_video\":true", "\"can_add_video\":false"), ("\"max_count\":200", "\"max_count\":2"), ("\"copyright\":1", "\"interactive\":1,\"copyright\":1"), ("\"copyright\":1", "\"charging_pay\":1,\"copyright\":1") })
+            {
+                var a = new FakeApi { DetailResponse = FakeApi.GoodDetailResponse.Replace(change.Item1, change.Item2) };
+                var st = new LocalState { Jobs = [Job()] }; using var c = new HttpClient(new UploadHandler());
+                await new QueueRunner(st, Path.Combine(Root, Guid.NewGuid().ToString("N")), new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+                Check(st.Jobs[0].State == "失败" && a.PreUploads == 0 && a.Edits == 0 && a.Published == 0);
+            }
+        });
+        await Test("A concurrent archive change detected immediately before editing prevents the edit", async () =>
+        {
+            var a = new FakeApi(); a.DuringDetailRead = n => { if (n == 3) a.DetailResponse = a.DetailResponse.Replace("原稿标题", "外部修改后的标题"); };
+            var st = new LocalState { Jobs = [Job()] }; using var c = new HttpClient(new UploadHandler());
+            await new QueueRunner(st, Path.Combine(Root, "append-conflict"), new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+            Check(st.Jobs[0].State == "失败" && !st.Jobs[0].AppendAttempted && a.Edits == 0 && a.PreUploads == 1);
+        });
+        await Test("Metadata changed during video transfer is refreshed rather than overwritten with old values", async () =>
+        {
+            var a = new FakeApi(); a.DuringDetailRead = n => { if (n == 2) a.DetailResponse = a.DetailResponse.Replace("原稿标题", "上传期间的新标题"); };
+            var st = new LocalState { Jobs = [Job()] }; using var c = new HttpClient(new UploadHandler());
+            await new QueueRunner(st, Path.Combine(Root, "append-fresh"), new(a, c)).RunAsync(AppendPreset(), _ => Task.CompletedTask, CancellationToken.None);
+            Check(st.Jobs[0].State == "已追加" && a.Edits == 1 && a.EditPayloads[0].GetProperty("title").GetString() == "上传期间的新标题");
+        });
         await Test("Actual HTTP streaming reports bytes delivered to a local test server", async () =>
         {
             var listener = new HttpListener();
@@ -542,6 +737,40 @@ static class Verify
     }
     sealed class FakeApi : IBiliApi
     {
+        public int DetailReads, Edits;
+        public bool RejectEdit, LoseEdit, KeepDetailAfterEdit, DropOldPartAfterEdit;
+        public string? EditResponse;
+        public Action? DuringEdit;
+        public Action<int>? DuringDetailRead;
+        public List<long> DetailAids = [];
+        public List<int> DetailReadsAtEdit = [];
+        public List<JsonElement> EditPayloads = [];
+        public const string GoodDetailResponse = """
+            {"code":0,"data":{"archive":{"aid":5000,"bvid":"BVexisting","mid":12345,"title":"原稿标题","copyright":1,"source":"","tid":171,"tag":"原标签,示例","desc":"原稿简介","cover":"https://i0.hdslb.com/bfs/archive/original.jpg","human_type2":{"id":3},"creation_statement":{"id":0},"recreate":{"switch":1},"is_360":-1,"is_dolby":1,"lossless_music":1},"videos":[{"cid":401,"filename":"old-first","title":"原P1","desc":"原分P简介"},{"cid":402,"filename":"old-second","title":"原P2","desc":""}],"replace_check":{"can_add_video":true},"space_hidden":1,"watermark":{"state":1},"client_limits":{"have_permission_of_p":true,"season_add_multip":true,"new_web_edit":{"max_count":200}}}}
+            """;
+        public string DetailResponse = GoodDetailResponse;
+        public Task<JsonElement> ArchiveDetailAsync(long aid, CancellationToken token)
+        {
+            token.ThrowIfCancellationRequested(); DetailReads++; DetailAids.Add(aid); DuringDetailRead?.Invoke(DetailReads);
+            return Task.FromResult(Json(DetailResponse));
+        }
+        public Task<JsonElement> EditArchiveAsync(object payload, CancellationToken token)
+        {
+            Edits++; DetailReadsAtEdit.Add(DetailReads);
+            var serialized = JsonSerializer.Serialize(payload); EditPayloads.Add(Json(serialized));
+            DuringEdit?.Invoke(); token.ThrowIfCancellationRequested();
+            if (LoseEdit) throw new HttpRequestException("lost edit response");
+            if (RejectEdit) return Task.FromResult(Json("{\"code\":21001,\"message\":\"暂时无法编辑\"}"));
+            if (EditResponse != null) return Task.FromResult(Json(EditResponse));
+            if (!KeepDetailAfterEdit)
+            {
+                var root = System.Text.Json.Nodes.JsonNode.Parse(DetailResponse)!;
+                var parts = (System.Text.Json.Nodes.JsonArray)System.Text.Json.Nodes.JsonNode.Parse(serialized)!["videos"]!.DeepClone();
+                if (DropOldPartAfterEdit) parts.RemoveAt(0);
+                root["data"]!["videos"] = parts; DetailResponse = root.ToJsonString();
+            }
+            return Task.FromResult(Json("{\"code\":0,\"data\":{\"aid\":5000,\"bvid\":\"BVexisting\"}}"));
+        }
         public int PreUploads, Published; public bool LosePublish, RejectPublish;
         public int CoverUploads, SeasonReads, SeasonAdds, ArchiveReads;
         public bool LoseCover, RemoveSeasonAfterRead, RejectSeasonAdd, LoseSeasonAdd;

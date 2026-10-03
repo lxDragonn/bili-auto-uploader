@@ -32,6 +32,16 @@ public sealed class BiliApi(CoreWebView2 browser) : IBiliApi
                 else if (a.operation === 'nav') path = 'https://api.bilibili.com/x/web-interface/nav';
                 else if (a.operation === 'seasons') path = '/x2/creative/web/seasons?' + new URLSearchParams({pn:String(a.payload.page),ps:'30',order:'desc',sort:'mtime',filter:'1'});
                 else if (a.operation === 'archive') path = '/x/web/archive/videos?' + new URLSearchParams({aid:String(a.payload.aid)});
+                else if (a.operation === 'archive-detail') path = '/x/vupre/web/archive/view?' + new URLSearchParams({aid:a.payload.aid,topic_grey:'1'});
+                else if (a.operation === 'white') path = '/x/vupre/web/archive/white';
+                else if (a.operation === 'archives') path = '/x/web/archives?' + new URLSearchParams({status:'is_pubing,pubed,not_pubed',pn:String(a.payload.page),ps:'10',keyword:a.payload.keyword});
+                else if (a.operation === 'edit') {
+                  if (!csrf()) return {clientError:'登录已失效，请重新登录'};
+                  path = '/x/vu/web/edit?csrf=' + encodeURIComponent(decodeURIComponent(csrf()));
+                  // The native serializer retains integer IDs exactly, even above JavaScript's safe-integer range.
+                  const body = a.payload.body.slice(0,-1) + ',"csrf":' + JSON.stringify(decodeURIComponent(csrf())) + '}';
+                  options = {...options, method:'POST', headers:{'Content-Type':'application/json'}, body};
+                }
                 else if (a.operation === 'cover') {
                   if (!csrf()) return {clientError:'登录已失效，请重新登录'};
                   path = '/x/vu/web/cover/up?csrf=' + encodeURIComponent(decodeURIComponent(csrf()));
@@ -92,6 +102,58 @@ public sealed class BiliApi(CoreWebView2 browser) : IBiliApi
     public Task<JsonElement> PublishAsync(object payload, CancellationToken token) => CallAsync("publish", payload, token);
     public Task<JsonElement> UploadCoverAsync(string dataUrl, CancellationToken token) => CallAsync("cover", new { dataUrl }, token);
     public Task<JsonElement> ArchiveAsync(long aid, CancellationToken token) => CallAsync("archive", new { aid }, token);
+    public async Task<JsonElement> ArchiveDetailAsync(long aid, CancellationToken token)
+    {
+        var detail = await CallAsync("archive-detail", new { aid = aid.ToString(System.Globalization.CultureInfo.InvariantCulture) }, token);
+        UposUploader.CheckCode(detail);
+        var white = await CallAsync("white", null, token);
+        UposUploader.CheckCode(white);
+        if (!white.TryGetProperty("data", out var permissions) || permissions.ValueKind != JsonValueKind.Object ||
+            !detail.TryGetProperty("data", out var data) || data.ValueKind != JsonValueKind.Object)
+            throw new ApiFailure("无法读取追加分 P 所需的稿件信息和权限。");
+        var document = System.Text.Json.Nodes.JsonNode.Parse(detail.GetRawText())!;
+        document["data"]!["client_limits"] = System.Text.Json.Nodes.JsonNode.Parse(permissions.GetRawText());
+        return JsonSerializer.SerializeToElement(document);
+    }
+    public Task<JsonElement> EditArchiveAsync(object payload, CancellationToken token)
+    {
+        var body = JsonSerializer.Serialize(payload);
+        if (!body.StartsWith('{') || !body.EndsWith('}')) throw new ApiFailure("追加分 P 请求格式无效。");
+        return CallAsync("edit", new { body }, token);
+    }
+    public async Task<ArchivePage> GetArchivesAsync(int page, string keyword, CancellationToken token)
+    {
+        if (page is < 1 or > 10000 || keyword.Length > 100) throw new ApiFailure("稿件页码或搜索关键字无效。");
+        var response = await CallAsync("archives", new { page, keyword }, token);
+        UposUploader.CheckCode(response);
+        if (!response.TryGetProperty("code", out _) || !response.TryGetProperty("data", out var data))
+            throw new ApiFailure("未能读取已有投稿，请重新登录后重试。");
+        return ParseArchives(data, page);
+    }
+
+    public static ArchivePage ParseArchives(JsonElement data, int page)
+    {
+        if (data.ValueKind != JsonValueKind.Object || !data.TryGetProperty("arc_audits", out var list) || list.ValueKind != JsonValueKind.Array)
+            throw new ApiFailure("已有投稿列表格式无法识别。");
+        var result = new List<ExistingArchive>();
+        foreach (var entry in list.EnumerateArray())
+        {
+            if (entry.ValueKind != JsonValueKind.Object || !entry.TryGetProperty("Archive", out var archive))
+            {
+                if (entry.ValueKind != JsonValueKind.Object || !entry.TryGetProperty("archive", out archive)) continue;
+            }
+            if (archive.ValueKind != JsonValueKind.Object || !archive.TryGetProperty("aid", out var aidNode) || !long.TryParse(aidNode.ToString(), out var aid) || aid <= 0 ||
+                !archive.TryGetProperty("title", out var title) || title.ValueKind != JsonValueKind.String) continue;
+            var bvid = archive.TryGetProperty("bvid", out var bv) && bv.ValueKind == JsonValueKind.String ? bv.GetString()! : "av" + aid;
+            var parts = archive.TryGetProperty("videos", out var count) && int.TryParse(count.ToString(), out var n) ? n : 0;
+            if (entry.TryGetProperty("cid_list", out var cids) && cids.ValueKind == JsonValueKind.Array) parts = cids.GetArrayLength();
+            result.Add(new(aid, bvid, title.GetString()!, parts));
+        }
+        var more = list.GetArrayLength() == 10;
+        if (data.TryGetProperty("page", out var pagination) && pagination.ValueKind == JsonValueKind.Object &&
+            pagination.TryGetProperty("count", out var total) && long.TryParse(total.ToString(), out var totalCount)) more = page * 10L < totalCount;
+        return new(result.DistinctBy(a => a.Aid).ToArray(), page, more);
+    }
     public Task<JsonElement> AddToSeasonAsync(long sectionId, long aid, long cid, string title, CancellationToken token) =>
         CallAsync("season-add", new { sectionId, episodes = new[] { new { title, cid, aid, charging_pay = 0 } } }, token);
 
